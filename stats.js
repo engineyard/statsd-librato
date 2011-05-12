@@ -1,7 +1,10 @@
-var dgram  = require('dgram')
-  , sys    = require('sys')
-  , net    = require('net')
-  , config = require('./config')
+var dgram      = require('dgram')
+  , sys        = require('sys')
+  , net        = require('net')
+  , config     = require('./config')
+  , base64     = require('base64')
+  , https      = require('https');
+
 
 var counters = {};
 var timers = {};
@@ -26,8 +29,8 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       var bits = msg.toString().split(':');
       var key = bits.shift()
                     .replace(/\s+/g, '_')
-                    .replace(/\//g, '-')
-                    .replace(/[^a-zA-Z_\-0-9\.]/g, '');
+                    .replace(/\.\//g, '-')
+                    .replace(/[^a-zA-Z_\-0-9]/g, '');
 
       if (bits.length == 0) {
         bits.push("1");
@@ -62,16 +65,18 @@ config.configFile(process.argv[2], function (config, oldConfig) {
     var flushInterval = Number(config.flushInterval || 10000);
 
     flushInt = setInterval(function () {
-      var statString = '';
+      var stats = {};
+      stats["gauges"] = {};
+      stats["counters"] = {};
       var ts = Math.round(new Date().getTime() / 1000);
       var numStats = 0;
       var key;
 
       for (key in counters) {
         var value = counters[key] / (flushInterval / 1000);
-        var message = 'stats.' + key + ' ' + value + ' ' + ts + "\n";
-        message += 'stats_counts.' + key + ' ' + counters[key] + ' ' + ts + "\n";
-        statString += message;
+        stats["counters"][key] = {};
+        stats["counters"][key]["value"] = value;
+
         counters[key] = 0;
 
         numStats += 1;
@@ -79,62 +84,65 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
       for (key in timers) {
         if (timers[key].length > 0) {
-          var pctThreshold = config.percentThreshold || 90;
           var values = timers[key].sort(function (a,b) { return a-b; });
           var count = values.length;
           var min = values[0];
           var max = values[count - 1];
 
-          var mean = min;
-          var maxAtThreshold = max;
-
-          if (count > 1) {
-            var thresholdIndex = Math.round(((100 - pctThreshold) / 100) * count);
-            var numInThreshold = count - thresholdIndex;
-            values = values.slice(0, numInThreshold);
-            maxAtThreshold = values[numInThreshold - 1];
-
-            // average the remaining timings
-            var sum = 0;
-            for (var i = 0; i < numInThreshold; i++) {
-              sum += values[i];
-            }
-
-            mean = sum / numInThreshold;
+          var sum = 0;
+          var sumOfSquares = 0;
+          for (var i = 0; i < count; i++) {
+            sum += values[i];
+            sumOfSquares += values[i] * values[i];
           }
 
           timers[key] = [];
-
-          var message = "";
-          message += 'stats.timers.' + key + '.mean ' + mean + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.upper ' + max + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.upper_' + pctThreshold + ' ' + maxAtThreshold + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.lower ' + min + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.count ' + count + ' ' + ts + "\n";
-          statString += message;
+          stats["gauges"][key] = {};
+          stats["gauges"][key]["count"] = count;
+          stats["gauges"][key]["sum_squares"] = sumOfSquares;
+          stats["gauges"][key]["sum"] = sum;
+          stats["gauges"][key]["min"] = min;
+          stats["gauges"][key]["max"] = max;
 
           numStats += 1;
         }
       }
 
-      statString += 'statsd.numStats ' + numStats + ' ' + ts + "\n";
-      
-      try {
-        var graphite = net.createConnection(config.graphitePort, config.graphiteHost);
-        graphite.addListener('error', function(connectionException){
-          if (config.debug) {
-            sys.log(connectionException);
-          }
-        });
-        graphite.on('connect', function() {
-          this.write(statString);
-          this.end();
-        });
-      } catch(e){
-        if (config.debug) {
-          sys.log(e);
+      stats["counters"]["numStats"] = {};
+      stats["counters"]["numStats"]["value"] = numStats;
+
+      var stats_str = JSON.stringify(stats);
+      sys.puts(stats_str);
+      sys.puts(stats_str.length);
+
+
+      var options = {
+        host: 'metrics-api.librato.com',
+        port: 443,
+        path: '/v1/metrics.json',
+        method: 'POST',
+        headers: {
+          "Authorization": 'Basic ' + base64.encode(new Buffer(config.libratoUser + ':' + config.libratoApiKey)),
+          "Content-Length": stats_str.length,
+          "Content-Type": "application/json"
         }
-      }
+      };
+
+      var req = https.request(options, function(res) {
+        console.log("statusCode: ", res.statusCode);
+        console.log("headers: ", res.headers);
+        res.on('data', function(d) {
+          sys.puts("Got some data");
+          process.stdout.write(d);
+        });
+      });
+      req.write(stats_str);
+      req.end();
+
+      req.on('error', function(e) {
+        console.error("There was an error");
+        console.error(e);
+      });
 
     }, flushInterval);
   }
